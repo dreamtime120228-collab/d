@@ -1,0 +1,140 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+from datetime import timedelta
+
+# --- 1. LPPLモデル関数の定義 ---
+def lppl_func(t, tc, A, B, C, beta, omega, phi):
+    """
+    Didier SornetteのLPPLモデル
+    t: 時間（数値）
+    tc: 臨界時間（クラッシュ予測時点）
+    beta: べき指数（成長の加速度）
+    omega: 対数周期振動の周波数
+    """
+    # tc - t が負になると計算できないため、微小な正の値を下限とする
+    dt = np.clip(tc - t, 1e-10, None)
+    return A + B * (dt ** beta) * (1 + C * np.cos(omega * np.log(dt) + phi))
+
+# --- 2. データ読み込みと前処理 ---
+def load_and_clean_data(file_path):
+    print(f"ファイルを読み込んでいます: {file_path}")
+    
+    # 日本語CSV特有のエンコーディング問題に対応
+    try:
+        df = pd.read_csv(file_path, encoding='utf-8')
+    except UnicodeDecodeError:
+        try:
+            df = pd.read_csv(file_path, encoding='shift_jis')
+        except UnicodeDecodeError:
+            df = pd.read_csv(file_path, encoding='cp932')
+
+    # カラム名の整理（スペース削除など）
+    df.columns = [c.strip() for c in df.columns]
+    
+    # 日付変換（エラーになるフッター行などを除去）
+    df['Date'] = pd.to_datetime(df['データ日付'], errors='coerce')
+    df = df.dropna(subset=['Date']) # 日付が無効な行を削除
+    
+    # 数値変換（終値）
+    df['Price'] = pd.to_numeric(df['終値'], errors='coerce')
+    
+    # 日付順にソート
+    df = df.sort_values('Date').reset_index(drop=True)
+    
+    return df
+
+# --- 3. メイン処理 ---
+def main():
+    file_path = 'nikkei_stock_average_daily_jp.csv'
+    
+    # データをロード
+    df_all = load_and_clean_data(file_path)
+    
+    # ★重要★ 解析期間の設定
+    # LPPLは「バブルの開始から崩壊まで」の単一トレンドにフィットさせるモデルです。
+    # 過去のデータすべてを含めると精度が落ちるため、直近の上昇トレンドの開始日を指定します。
+    # ここでは例として「2024年1月1日以降」を解析対象とします。
+    analysis_start_date = '2024-01-01'
+    
+    print(f"解析対象期間: {analysis_start_date} 以降")
+    df = df_all[df_all['Date'] >= analysis_start_date].copy()
+    
+    if len(df) < 30:
+        print("データが少なすぎます。開始日をもっと過去に設定してください。")
+        return
+
+    # 時間軸(t)と価格(y)の作成
+    # tは「開始日からの経過日数」として数値化します
+    t_start_date = df['Date'].iloc[0]
+    t_data = (df['Date'] - t_start_date).dt.days.values
+    y_data = np.log(df['Price'].values) # 対数価格を使用
+
+    # --- 4. パラメータ推定（フィッティング） ---
+    
+    # 初期値の推定 (Initial Guess)
+    # tcの初期値は「データの最終日 + 30日」くらいに設定
+    last_day = t_data[-1]
+    initial_tc = last_day + 30 
+    
+    # [tc, A, B, C, beta, omega, phi]
+    p0 = [initial_tc, np.mean(y_data), -0.1, 0.1, 0.5, 10, 0]
+    
+    # パラメータの探索範囲 (Bounds)
+    # beta: 0.1 ~ 0.9 (理論的に推奨される範囲)
+    # omega: 4 ~ 25 (対数周期性の典型的な範囲)
+    bounds = (
+        [last_day,  0, -np.inf, -np.inf, 0.1, 4, -np.pi*2], # 下限
+        [last_day + 365, 20, np.inf,  np.inf, 0.9, 25, np.pi*2] # 上限
+    )
+    
+    print("モデルフィッティングを実行中...")
+    try:
+        popt, pcov = curve_fit(lppl_func, t_data, y_data, p0=p0, bounds=bounds, maxfev=10000)
+        
+        # --- 5. 結果の表示 ---
+        estimated_tc_days = popt[0]
+        estimated_date = t_start_date + timedelta(days=estimated_tc_days)
+        
+        print("-" * 50)
+        print(f"【解析結果】")
+        print(f"予測される臨界点 (tc): {estimated_date.strftime('%Y-%m-%d')}")
+        print(f"べき指数 (beta): {popt[4]:.4f} (0.1-0.9が理論的適正値)")
+        print(f"対数周波数 (omega): {popt[5]:.4f} (6-15付近が典型的)")
+        print("-" * 50)
+        
+        # プロット作成
+        plt.figure(figsize=(12, 6))
+        
+        # 実データ
+        plt.plot(df['Date'], df['Price'], label='Actual Price', color='black', linewidth=1)
+        
+        # フィッティング曲線（未来まで描画）
+        future_days = 60 # 予測線の描画期間（日）
+        t_future = np.linspace(0, estimated_tc_days - 1, 1000) # クラッシュ直前まで
+        y_fit = lppl_func(t_future, *popt)
+        price_fit = np.exp(y_fit) # 対数価格を元の価格に戻す
+        
+        date_fit = [t_start_date + timedelta(days=d) for d in t_future]
+        
+        plt.plot(date_fit, price_fit, label='LPPL Model Fit', color='red', linewidth=2)
+        
+        # 予測ライン
+        plt.axvline(x=estimated_date, color='blue', linestyle='--', label=f'Predicted: {estimated_date.strftime("%Y-%m-%d")}')
+        
+        plt.title('Didier Sornette LPPL Model - Nikkei 225 Analysis')
+        plt.xlabel('Date')
+        plt.ylabel('Price (JPY)')
+        plt.legend()
+        plt.grid(True)
+        
+        # グラフを保存または表示
+        plt.show()
+        
+    except RuntimeError as e:
+        print(f"フィッティングに失敗しました: {e}")
+        print("解析開始日を変更するか、初期値を調整してください。")
+
+if __name__ == "__main__":
+    main()
